@@ -72,3 +72,42 @@
 
 ### Exercise 5.4: Load balancing
 - Chạy `scale agent=3` sẽ tạo ra 3 bản sao của container Agent. Nginx sẽ đứng trước làm Proxy (Round Robin), chia đều traffic lần lượt vào 3 Agent để giảm tải cho mỗi node.
+
+---
+
+## Part 6: Final Project — Production AI Agent
+
+### 🌐 Deployed URL
+> **https://ai-agent-production-7vsu.onrender.com**
+
+### Test endpoints
+```bash
+# Health check
+curl https://ai-agent-production-7vsu.onrender.com/health
+
+# Readiness check
+curl https://ai-agent-production-7vsu.onrender.com/ready
+
+# Ask agent (cần API Key)
+curl https://ai-agent-production-7vsu.onrender.com/ask -X POST \
+  -H "X-API-Key: <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Hello"}'
+```
+
+### Production Features Implemented
+| Feature | Status |
+|---------|--------|
+| REST API (`/ask`) | ✅ |
+| Conversation history (Redis) | ✅ |
+| Multi-stage Docker build | ✅ |
+| Environment variables config (12-Factor) | ✅ |
+| API Key authentication | ✅ |
+| Rate limiting (10 req/min/user) | ✅ |
+| Cost guard ($10/month/user) | ✅ |
+| Health check (`/health`) | ✅ |
+| Readiness check (`/ready`) | ✅ |
+| Graceful shutdown (SIGTERM) | ✅ |
+| Stateless design (Redis) | ✅ |
+| Structured JSON logging | ✅ |
+| Deploy on Render | ✅ |
