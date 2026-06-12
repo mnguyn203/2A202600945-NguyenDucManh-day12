@@ -3,6 +3,7 @@ services:
     name: ai-agent-redis
     region: singapore
     plan: free
+    ipAllowList: [] # Bắt buộc bởi quy định bảo mật mới của Render
 
   - type: web
     name: ai-agent-production
