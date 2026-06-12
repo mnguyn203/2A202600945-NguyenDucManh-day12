@@ -103,7 +103,7 @@ async def lifespan(app: FastAPI):
     db_path = os.path.join(os.path.dirname(__file__), "chroma_db")
     try:
         chroma_client = chromadb.PersistentClient(path=db_path)
-        emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        emb = embedding_functions.DefaultEmbeddingFunction()
         chroma_collection = chroma_client.get_collection(name="day10_kb", embedding_function=emb)
         logger.info(json.dumps({"event": "chromadb_ready", "path": db_path}))
     except Exception as e:
