@@ -20,6 +20,12 @@ import redis
 from app.config import settings
 from utils.mock_llm import ask as llm_ask
 
+import chromadb
+from chromadb.utils import embedding_functions
+
+chroma_client = None
+chroma_collection = None
+
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
 # ─────────────────────────────────────────────────────────
@@ -91,8 +97,19 @@ def verify_api_key(api_key: str = Security(api_key_header)) -> str:
 # ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _is_ready
+    global _is_ready, chroma_client, chroma_collection
     logger.info(json.dumps({"event": "startup", "app": settings.app_name}))
+    
+    # Init ChromaDB
+    db_path = os.path.join(os.path.dirname(__file__), "chroma_db")
+    try:
+        chroma_client = chromadb.PersistentClient(path=db_path)
+        emb = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        chroma_collection = chroma_client.get_collection(name="day10_kb", embedding_function=emb)
+        logger.info(json.dumps({"event": "chromadb_ready", "path": db_path}))
+    except Exception as e:
+        logger.error(json.dumps({"event": "chromadb_error", "error": str(e)}))
+        
     time.sleep(0.1)
     _is_ready = True
     logger.info(json.dumps({"event": "ready"}))
@@ -188,8 +205,19 @@ async def ask_agent(body: AskRequest, _key: str = Depends(verify_api_key)):
     # 3. Lấy Lịch sử từ Redis
     history_key = f"history:{user_id}"
     
-    # 4. Gọi Mock LLM
-    answer = llm_ask(body.question)
+    # 4. Gọi Retrieval từ ChromaDB
+    answer = "Không tìm thấy thông tin."
+    if chroma_collection:
+        try:
+            res = chroma_collection.query(query_texts=[body.question], n_results=1)
+            docs = (res.get("documents") or [[]])[0]
+            if docs:
+                answer = f"Truy xuất từ tài liệu:\n{docs[0]}"
+        except Exception as e:
+            logger.error(f"Chroma query error: {e}")
+            answer = f"Lỗi truy xuất dữ liệu: {e}"
+    else:
+        answer = "Hệ thống ChromaDB chưa sẵn sàng."
     
     # 5. Budget Check (Output)
     output_tokens = len(answer.split()) * 2
