@@ -42,7 +42,7 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 WORKDIR /app
 
 # Copy installed packages từ builder
-COPY --from=builder /root/.local /home/appuser/.local
+COPY --chown=appuser:appuser --from=builder /root/.local /home/appuser/.local
 
 # Copy source code
 COPY 02-docker/production/main.py .

@@ -15,15 +15,8 @@ from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
-import redis
 
 from app.config import settings
-
-import chromadb
-from chromadb.utils import embedding_functions
-
-chroma_client = None
-chroma_collection = None
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -40,43 +33,68 @@ _request_count = 0
 _error_count = 0
 
 # ─────────────────────────────────────────────────────────
-# Khởi tạo kết nối Redis
+# Khởi tạo kết nối Redis (lazy — không crash nếu chưa có)
 # ─────────────────────────────────────────────────────────
-# Nếu không truyền biến REDIS_URL, dùng mặc định localhost:6379 để dev
-REDIS_URL = settings.redis_url or "redis://localhost:6379"
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+redis_client = None
+
+def _get_redis():
+    """Lazy init Redis — chỉ kết nối khi thực sự cần."""
+    global redis_client
+    if redis_client is None:
+        import redis
+        REDIS_URL = settings.redis_url or "redis://localhost:6379"
+        redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    return redis_client
+
+# ─────────────────────────────────────────────────────────
+# ChromaDB (lazy init in lifespan)
+# ─────────────────────────────────────────────────────────
+chroma_client = None
+chroma_collection = None
 
 # ─────────────────────────────────────────────────────────
 # Rate Limiting & Cost Guard (Redis - Stateless)
 # ─────────────────────────────────────────────────────────
 def check_rate_limit(user_id: str):
     """Giới hạn 10 request/phút mỗi user bằng Redis (Tạo state stateless)."""
-    current_minute = int(time.time() // 60)
-    key = f"rate_limit:{user_id}:{current_minute}"
-    
-    count = redis_client.incr(key)
-    if count == 1:
-        redis_client.expire(key, 60) # Chỉ giữ key này trong 60s
+    try:
+        r = _get_redis()
+        current_minute = int(time.time() // 60)
+        key = f"rate_limit:{user_id}:{current_minute}"
         
-    limit = settings.rate_limit_per_minute
-    if count > limit:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {limit} req/min",
-            headers={"Retry-After": "60"},
-        )
+        count = r.incr(key)
+        if count == 1:
+            r.expire(key, 60)  # Chỉ giữ key này trong 60s
+            
+        limit = settings.rate_limit_per_minute
+        if count > limit:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded: {limit} req/min",
+                headers={"Retry-After": "60"},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Rate limit check failed (Redis unavailable): {e}")
 
 def check_budget(user_id: str, cost: float):
     """Giới hạn $10 mỗi tháng bằng Redis."""
-    current_month = datetime.now().strftime("%Y-%m")
-    key = f"budget:{user_id}:{current_month}"
-    
-    current = float(redis_client.get(key) or 0.0)
-    if current + cost > settings.daily_budget_usd:
-        raise HTTPException(503, "Monthly budget exhausted. Try again next month.")
+    try:
+        r = _get_redis()
+        current_month = datetime.now().strftime("%Y-%m")
+        key = f"budget:{user_id}:{current_month}"
         
-    redis_client.incrbyfloat(key, cost)
-    redis_client.expire(key, 32 * 24 * 3600)  # Tự động xoá sau 32 ngày
+        current = float(r.get(key) or 0.0)
+        if current + cost > settings.daily_budget_usd:
+            raise HTTPException(503, "Monthly budget exhausted. Try again next month.")
+            
+        r.incrbyfloat(key, cost)
+        r.expire(key, 32 * 24 * 3600)  # Tự động xoá sau 32 ngày
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"Budget check failed (Redis unavailable): {e}")
 
 # ─────────────────────────────────────────────────────────
 # Authentication
@@ -99,15 +117,27 @@ async def lifespan(app: FastAPI):
     global _is_ready, chroma_client, chroma_collection
     logger.info(json.dumps({"event": "startup", "app": settings.app_name}))
     
+    # Init Redis connection
+    try:
+        r = _get_redis()
+        r.ping()
+        logger.info(json.dumps({"event": "redis_ready"}))
+    except Exception as e:
+        logger.warning(json.dumps({"event": "redis_unavailable", "error": str(e)}))
+    
     # Init ChromaDB
     db_path = os.path.join(os.path.dirname(__file__), "chroma_db")
     try:
+        import chromadb
+        from chromadb.utils import embedding_functions
         chroma_client = chromadb.PersistentClient(path=db_path)
         emb = embedding_functions.DefaultEmbeddingFunction()
-        chroma_collection = chroma_client.get_collection(name="day10_kb", embedding_function=emb)
+        chroma_collection = chroma_client.get_or_create_collection(
+            name="day10_kb", embedding_function=emb
+        )
         logger.info(json.dumps({"event": "chromadb_ready", "path": db_path}))
     except Exception as e:
-        logger.error(json.dumps({"event": "chromadb_error", "error": str(e)}))
+        logger.warning(json.dumps({"event": "chromadb_unavailable", "error": str(e)}))
         
     time.sleep(0.1)
     _is_ready = True
@@ -138,7 +168,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
@@ -170,7 +201,7 @@ class AskResponse(BaseModel):
 # ─────────────────────────────────────────────────────────
 @app.get("/health", tags=["Operations"])
 def health():
-    """Liveness probe. Nếu container bị đơ, orchchestrator sẽ restart."""
+    """Liveness probe. Nếu container bị đơ, orchestrator sẽ restart."""
     return {
         "status": "ok", 
         "uptime_seconds": round(time.time() - START_TIME, 1)
@@ -178,14 +209,16 @@ def health():
 
 @app.get("/ready", tags=["Operations"])
 def ready():
-    """Readiness probe. Check xem Redis có sống không."""
+    """Readiness probe. Check xem app đã sẵn sàng chưa."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
+    # Check Redis nếu có
     try:
-        redis_client.ping()
-        return {"ready": True}
+        r = _get_redis()
+        r.ping()
     except Exception:
         raise HTTPException(503, "Redis not available")
+    return {"ready": True}
 
 @app.post("/ask", response_model=AskResponse, tags=["Agent"])
 async def ask_agent(body: AskRequest, _key: str = Depends(verify_api_key)):
@@ -224,12 +257,15 @@ async def ask_agent(body: AskRequest, _key: str = Depends(verify_api_key)):
     check_budget(user_id, cost_out)
     
     # 6. Lưu lịch sử vào Redis (chỉ giữ 10 dòng gần nhất)
-    redis_client.rpush(history_key, f"User: {body.question}")
-    redis_client.rpush(history_key, f"Agent: {answer}")
-    redis_client.ltrim(history_key, -10, -1)
-    
-    # Lấy lịch sử sau khi cập nhật
-    updated_history = redis_client.lrange(history_key, 0, -1)
+    try:
+        r = _get_redis()
+        r.rpush(history_key, f"User: {body.question}")
+        r.rpush(history_key, f"Agent: {answer}")
+        r.ltrim(history_key, -10, -1)
+        updated_history = r.lrange(history_key, 0, -1)
+    except Exception as e:
+        logger.warning(f"Redis history failed: {e}")
+        updated_history = []
     
     return AskResponse(
         question=body.question,
