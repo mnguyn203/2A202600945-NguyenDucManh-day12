@@ -18,7 +18,6 @@ import uvicorn
 import redis
 
 from app.config import settings
-from utils.mock_llm import ask as llm_ask
 
 import chromadb
 from chromadb.utils import embedding_functions
